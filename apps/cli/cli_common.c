@@ -71,6 +71,10 @@
 #include "cli_plugin.h"
 #include "cli_common.h"
 
+/* for consistent use with clicon_key_* functions */
+#define BATCH "BATCH"
+
+
 /*! Register log notification stream
  * @param[in] h       Clicon handle
  * @param[in] stream  Event stream. CLICON is predefined, others are application-defined
@@ -252,6 +256,7 @@ cli_dbxml(clicon_handle       h,
     int        ret;
     cg_var    *cv;
     int        cvv_i = 0;
+    cxobj     *batch;           /* accumulated batch configuration xml */
 
     if (cvec_len(argv) != 1){
 	clicon_err(OE_PLUGIN, EINVAL, "Requires one element to be xml key format string");
@@ -321,14 +326,29 @@ cli_dbxml(clicon_handle       h,
 		goto done;
 	}
     }
-    if ((cb = cbuf_new()) == NULL){
-	clicon_err(OE_XML, errno, "cbuf_new");
-	goto done;
+    if (clicon_ptr_get(h, BATCH, (void **) &batch) == 0) {
+        clicon_debug(1, "batch found");
+        clicon_debug(2, "batch xml: %s", clicon_xml2str(batch));
+        clicon_debug(2, "xtop xml: %s", clicon_xml2str(xtop));
+        if (xml_merge(batch, xtop, yspec, NULL) < 1) {
+            clicon_err(OE_XML, 0, "xml_merge");
+            goto done;
+        }
+        if (clicon_ptr_set(h, BATCH, batch) < 0)
+            goto done;
+    } else {
+        clicon_debug(1, "batch not found");
+
+        if ((cb = cbuf_new()) == NULL){
+            clicon_err(OE_XML, errno, "cbuf_new");
+            goto done;
+        }
+        if (clicon_xml2cbuf(cb, xtop, 0, 0, -1) < 0)
+            goto done;
+        if (clicon_rpc_edit_config(h, "candidate", OP_NONE, cbuf_get(cb)) < 0)
+            goto done;
     }
-    if (clicon_xml2cbuf(cb, xtop, 0, 0, -1) < 0)
-	goto done;
-    if (clicon_rpc_edit_config(h, "candidate", OP_NONE, cbuf_get(cb)) < 0)
-	goto done;
+
     retval = 0;
  done:
     if (xerr)
@@ -823,7 +843,7 @@ load_config_file(clicon_handle h,
     char            *formatstr = NULL;
     enum format_enum format = FORMAT_XML;
     yang_stmt       *yspec;
-    cxobj           *xerr = NULL; 
+    cxobj           *xerr = NULL;
 
     if (cvec_len(argv) < 2 || cvec_len(argv) > 4){
 	clicon_err(OE_PLUGIN, EINVAL, "Received %d arguments. Expected: <dbname>,<varname>[,<format>]",
@@ -890,6 +910,8 @@ load_config_file(clicon_handle h,
 	    char         *lineptr = NULL;
 	    size_t        n;
 
+        cli_batch_start(h, NULL, NULL);
+
 	    while(!cligen_exiting(cli_cligen(h))) {
 		lineptr = NULL; n = 0;
 		if (getline(&lineptr, &n, fp) < 0){
@@ -897,6 +919,8 @@ load_config_file(clicon_handle h,
 			clicon_err(OE_UNIX, errno, "getline");
 			goto done;
 		    }
+
+            cli_batch_finish(h, NULL, NULL);
 		    goto ok; /* eof, skip backend rpc since this is done by cli code */
 		}
 		if (clicon_parse(h, lineptr, &mode, &result, &evalresult) < 0)
@@ -936,6 +960,8 @@ load_config_file(clicon_handle h,
  ok:
     ret = 0;
  done:
+    if (cli_batch_active(h, NULL, NULL))
+        cli_batch_abort(h, NULL, NULL);
     if (xerr)
 	xml_free(xerr);
     if (xt)
@@ -1471,6 +1497,143 @@ cli_restart_plugin(clicon_handle h,
     plugin = cv_string_get(cv);
     retval = clicon_rpc_restart_plugin(h, plugin);    
  done:
+    return retval;
+}
+
+/*! Support function for determining if a configuration batch is active
+ *
+ * @param[in] h      Clicon handle
+ * @param[in] cvv    Not used
+ * @param[in] arg    Not used
+ * @retval     1     batch is active
+ * @retval     0     batch not active
+ */
+int
+cli_batch_active(clicon_handle h,
+                 cvec          *argv,
+                 cvec          *cvv)
+{
+    clicon_hash_t *cdat = clicon_data(h);
+
+    return clicon_hash_lookup(cdat, "batch") != NULL;
+}
+
+/*! Support function for starting a configuration batch
+ *
+ * @param[in] h      Clicon handle
+ * @param[in] cvv    Not used
+ * @param[in] arg    Not used
+ * @retval     0     OK
+ * @retval    -1     error
+ * @retval    -2     batch already in progress
+ */
+int
+cli_batch_start(clicon_handle h,
+                cvec          *argv,
+                cvec          *cvv)
+{
+    cxobj *batch = NULL;
+    int    retval = -1;
+
+    if (cli_batch_active(h, NULL, NULL) == 1) {
+        /* a batch already exists */
+        retval = 2;
+        goto done;
+    }
+
+    if ((batch = xml_new(NETCONF_INPUT_CONFIG, NULL, CX_ELMNT)) == NULL)
+        goto cleanup;
+
+    if (clicon_ptr_set(h, BATCH, batch) < 0)
+        goto cleanup;
+
+    retval = 0;
+    goto done;
+
+    cleanup:
+    if (batch)
+        xml_free(batch);
+
+    done:
+    return retval;
+}
+
+/*! Support function for finishing a configuration batch
+ *
+ * @param[in] h      Clicon handle
+ * @param[in] cvv    Not used
+ * @param[in] arg    Not used
+ * @retval     0     OK
+ * @retval    -1     error
+ * @retval    -2     an error retrieving the batch occurred, or a batch is not in progress
+ */
+int
+cli_batch_finish(clicon_handle h,
+                 cvec          *argv,
+                 cvec          *cvv)
+{
+    cxobj *batch = NULL;
+    cbuf  *cb    = NULL;
+    int   retval = -1;
+
+    if (clicon_ptr_get(h, BATCH, (void **) &batch) < 0) {
+        retval = -2;
+        goto done;
+    }
+
+    if ((cb = cbuf_new()) == NULL) {
+        clicon_err(OE_XML, errno, "cbuf_new");
+        goto done;
+    }
+
+    if (clicon_xml2cbuf(cb, batch, 0, 0, -1) < 0)
+        goto done;
+    if (clicon_rpc_edit_config(h, "candidate", OP_NONE, cbuf_get(cb)) < 0)
+        goto done;
+
+    clicon_ptr_del(h, BATCH);
+
+    retval = 0;
+
+    done:
+    if (batch)
+        free(batch);
+
+    if (cb)
+        cbuf_free(cb);
+
+    return retval;
+}
+
+/*! Support function for aborting a configuration batch
+ *
+ * @param[in] h      Clicon handle
+ * @param[in] cvv    Not used
+ * @param[in] arg    Not used
+ * @retval     0     OK
+ * @retval    -1     error
+ * @retval    -2     an error retrieving the batch occurred, or a batch is not in progress
+ */
+int
+cli_batch_abort(clicon_handle h,
+                cvec          *argv,
+                cvec          *cvv)
+{
+    int    retval = -1;
+
+    if (cli_batch_active(h, NULL, NULL) == 0) {
+        /* batch_abort should only be called after batch_begin */
+        retval = -2;
+        goto done;
+    }
+
+    if (clicon_ptr_del(h, BATCH) < 0)
+        goto done;
+
+    retval = 0;
+
+    done:
+
     return retval;
 }
 

@@ -214,7 +214,11 @@ expand_dbvar(void   *h,
     cbuf            *cbxpath = NULL;
     yang_stmt       *ypath;
     yang_stmt       *ytype;
-    
+
+    /* In batch mode, we don't want to perform path expansions */
+    if (cli_batch_active(h, NULL, NULL))
+        goto ok;
+
     if (argv == NULL || cvec_len(argv) != 2){
 	clicon_err(OE_PLUGIN, EINVAL, "requires arguments: <db> <xmlkeyfmt>");
 	goto done;
