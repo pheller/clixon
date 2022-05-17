@@ -328,8 +328,6 @@ cli_dbxml(clicon_handle       h,
     }
     if (clicon_ptr_get(h, BATCH, (void **) &batch) == 0) {
         clicon_debug(1, "batch found");
-        clicon_debug(2, "batch xml: %s", clicon_xml2str(batch));
-        clicon_debug(2, "xtop xml: %s", clicon_xml2str(xtop));
         if (xml_merge(batch, xtop, yspec, NULL) < 1) {
             clicon_err(OE_XML, 0, "xml_merge");
             goto done;
